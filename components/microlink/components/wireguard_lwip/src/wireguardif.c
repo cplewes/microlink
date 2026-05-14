@@ -537,10 +537,15 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
 								if (dest_ok) {
-									// Send packet to be processed by LWIP
+									// Send packet to be processed by LWIP.
+									// Honor netif->input (MicroLink wires this to tcpip_input) so the
+									// decrypted packet is processed on the TCPIP thread. Calling
+									// ip_input directly from ml_wg_mgr races the TCPIP thread on TCP
+									// PCB state and crashes with pbuf_free: p->ref > 0 under load.
 									WG_DEBUG("[WG_RX_IP] Passing %u bytes to IP layer\n", (unsigned)pbuf->tot_len);
-									ip_input(pbuf, device->netif);
-									// pbuf is owned by IP layer now
+									if (device->netif->input(pbuf, device->netif) != ERR_OK) {
+										pbuf_free(pbuf);  /* input took ownership only on ERR_OK */
+									}
 									pbuf = NULL;
 								} else {
 									WG_DEBUG("[WG_RX_IP] DROPPED: dest_ok=false\n");
