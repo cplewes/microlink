@@ -638,6 +638,21 @@ void ml_derp_tx_task(void *arg) {
  * DERP Connection Management (called from coord task)
  * ========================================================================== */
 
+/* Free the mbedtls state initialized in ml_derp_connect's TLS phase and
+ * close the underlying socket. Used by both ml_derp_disconnect (graceful
+ * teardown, after close_notify) and the fail_tls cleanup path in
+ * ml_derp_connect (handshake-failure unwind). */
+static void derp_free_tls_state(microlink_t *ml) {
+    mbedtls_ssl_free(&ml->derp.ssl);
+    mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+    mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
+    mbedtls_entropy_free(&ml->derp.entropy);
+    if (ml->derp.sockfd >= 0) {
+        ml_close_sock(ml->derp.sockfd);
+        ml->derp.sockfd = -1;
+    }
+}
+
 esp_err_t ml_derp_connect(microlink_t *ml) {
     /* Determine DERP host/port from DERPMap with node failover.
      * Always start from node 0 (the first/preferred node in the DERPMap).
@@ -991,20 +1006,10 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     return ESP_OK;
 
 fail_tls:
-    /* Reached on any error after mbedtls_ssl_init. Free the mbedtls
-     * structures so we don't leak ~3-8 KB of internal heap per failed
-     * connect. Without this cleanup, repeated DERP TLS handshake
-     * failures fragment the heap until even a fresh handshake can't
-     * allocate buffers — observed 2026-05-20 going from ~26 KB free
-     * internal at boot down to ~10 KB after a handful of failed
-     * attempts, after which every subsequent handshake fails with
-     * "SSL - Memory allocation failed". */
-    mbedtls_ssl_free(&ml->derp.ssl);
-    mbedtls_ssl_config_free(&ml->derp.ssl_conf);
-    mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
-    mbedtls_entropy_free(&ml->derp.entropy);
-    ml_close_sock(sock);
-    ml->derp.sockfd = -1;
+    /* Reached on any error after mbedtls_ssl_init. Without this teardown
+     * each failed handshake leaks the mbedtls state (~3-8 KB internal)
+     * until even a fresh handshake can't allocate buffers. */
+    derp_free_tls_state(ml);
     return ESP_FAIL;
 }
 
@@ -1014,12 +1019,7 @@ void ml_derp_disconnect(microlink_t *ml) {
 
     if (ml->derp.sockfd >= 0) {
         mbedtls_ssl_close_notify(&ml->derp.ssl);
-        mbedtls_ssl_free(&ml->derp.ssl);
-        mbedtls_ssl_config_free(&ml->derp.ssl_conf);
-        mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
-        mbedtls_entropy_free(&ml->derp.entropy);
-        ml_close_sock(ml->derp.sockfd);
-        ml->derp.sockfd = -1;
+        derp_free_tls_state(ml);
     }
 
     /* Drain TX queue */
