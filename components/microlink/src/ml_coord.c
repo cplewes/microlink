@@ -36,6 +36,16 @@
 
 static const char *TAG = "ml_coord";
 
+// Set true when a coord handshake is rejected by a captive-portal redirect
+// (HTTP 302). Read by the reconnect backoff to wait minutes instead of the
+// usual <=16 s: hammering a portal every 16 s is futile until the user logs
+// in, and the repeated TLS churn starves the shared 2.4 GHz radio (BLE coex)
+// and internal heap. Cleared when the long backoff is applied; re-set by the
+// next portal'd handshake. The backoff wait is command-queue-interruptible,
+// so a real wake (new creds / rebind / portal cleared) still recovers fast.
+static volatile bool s_captive_portal = false;
+#define ML_CAPTIVE_PORTAL_BACKOFF_MS  300000   /* 5 min */
+
 /* Effective control plane host: NVS override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
 
@@ -347,6 +357,9 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     /* Verify 101 Switching Protocols */
     if (strstr((char *)resp, "101") == NULL) {
         ESP_LOGE(TAG, "Noise upgrade rejected: %.200s", resp);
+        // A 302 redirect here means a captive portal intercepted us. Tell the
+        // reconnect loop to back off minutes instead of hammering every 16 s.
+        if (strstr((char *)resp, "302") != NULL) s_captive_portal = true;
         free(resp);
         return -1;
     }
@@ -2548,6 +2561,16 @@ void ml_coord_task(void *arg) {
             {
                 uint32_t backoff_ms = 1000 << (reconnect_attempts > 4 ? 4 : reconnect_attempts);
                 if (backoff_ms > ML_CTRL_BACKOFF_MAX_MS) backoff_ms = ML_CTRL_BACKOFF_MAX_MS;
+                // Behind a captive portal, retrying every <=16 s is futile and
+                // starves BLE (radio coex) + internal heap. Back off minutes
+                // instead; the wait below is command-queue-interruptible, so a
+                // real event (creds/rebind/portal cleared) still wakes us.
+                if (s_captive_portal) {
+                    backoff_ms = ML_CAPTIVE_PORTAL_BACKOFF_MS;
+                    s_captive_portal = false;   // re-set by the next portal'd handshake
+                    ESP_LOGW(TAG, "captive portal detected — backing off %lu ms",
+                             (unsigned long)backoff_ms);
+                }
 
                 ESP_LOGI(TAG, "Reconnecting in %lu ms (attempt %d)",
                          (unsigned long)backoff_ms, reconnect_attempts + 1);
