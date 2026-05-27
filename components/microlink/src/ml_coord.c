@@ -347,6 +347,14 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     int total = ml_recv(ml->coord_sock, resp, 2047, 0);
     if (total <= 0) {
         ESP_LOGE(TAG, "Handshake recv failed: %d (errno=%d)", total, errno);
+        // Some captive portals close the TCP connection immediately
+        // (returning 0 / errno=ENETDOWN) instead of responding with the
+        // 302 redirect we catch below. TCP-connected-then-immediately-
+        // closed is the same situation from our perspective: the path is
+        // intercepted and retrying every 16 s is futile. Trigger the
+        // long backoff. (False positives — a genuine network blip — are
+        // harmless: the long wait is command-queue-interruptible.)
+        s_captive_portal = true;
         free(resp);
         return -1;
     }
