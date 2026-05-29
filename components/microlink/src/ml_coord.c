@@ -46,6 +46,16 @@ static const char *TAG = "ml_coord";
 static volatile bool s_captive_portal = false;
 #define ML_CAPTIVE_PORTAL_BACKOFF_MS  300000   /* 5 min */
 
+/* Empty-MapResponse cycle protection. The server is allowed to close
+ * the response stream without a body in unusual cases (auth issue,
+ * captive-portal middlebox truncation, etc.). When that happens
+ * repeatedly we used to thrash at the 1–16 s reconnect backoff
+ * forever; this counter trips the captive-portal backoff (5 min)
+ * after 2 consecutive empties, then resets on the next successful
+ * MapResponse. */
+static volatile int s_consec_empty_map = 0;
+#define ML_CONSEC_EMPTY_THRESHOLD     2
+
 /* Effective control plane host: NVS override or compiled default */
 #define CTRL_HOST(ml) ((ml)->ctrl_host[0] ? (ml)->ctrl_host : ML_CTRL_HOST)
 
@@ -1525,6 +1535,25 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         ESP_LOGI(TAG, "  H2 frame: type=%d flags=0x%02x len=%lu stream=%lu",
                  f_type, f_flags, (unsigned long)f_len, (unsigned long)f_stream);
 
+        // For HEADERS frames, dump the first few payload bytes. The
+        // HPACK static table indexes :status pseudo-headers as 1-byte
+        // values (0x88=200, 0x89=204, 0x8c=400, 0x8d=404, 0x8e=500),
+        // so even without a full HPACK decoder this gives enough
+        // signal to diagnose "Empty MapResponse" — was the server
+        // really returning 200 OK with no body (true Tailscale-side
+        // problem) or 4xx/5xx (request rejected, NodeKey stale, etc.)?
+        if (f_type == 0x01 && f_len > 0 && fpos + (int)f_len <= (int)h2_total) {
+            size_t preview = f_len > 8 ? 8 : f_len;
+            char hex[33];
+            for (size_t i = 0; i < preview; i++) {
+                sprintf(hex + i * 3, "%02x ", h2_recv[fpos + i]);
+            }
+            hex[preview * 3 - 1] = '\0';
+            ESP_LOGI(TAG, "    HEADERS payload (first %u bytes): %s "
+                          "(0x88=200, 0x89=204, 0x8c=400, 0x8d=404, 0x8e=500)",
+                     (unsigned)preview, hex);
+        }
+
         if (fpos + (int)f_len > (int)h2_total) {
             ESP_LOGW(TAG, "  Incomplete H2 frame at end (need %lu, have %d)",
                      (unsigned long)f_len, (int)h2_total - fpos);
@@ -1553,10 +1582,27 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     if (json_total == 0) {
-        ESP_LOGW(TAG, "Empty MapResponse");
+        s_consec_empty_map++;
+        ESP_LOGW(TAG, "Empty MapResponse (consecutive=%d)", s_consec_empty_map);
+        if (s_consec_empty_map >= ML_CONSEC_EMPTY_THRESHOLD) {
+            // Server is cleanly closing the stream with no body — either
+            // a real Tailscale-side reject (bad NodeKey / stale Noise
+            // epoch) or a captive-portal middlebox truncating HTTP/2
+            // streams. Either way, hammering at the 1–16 s backoff
+            // makes the situation worse: it adds to any rate-limit
+            // counter the portal is keeping, and burns BLE coex time.
+            // Escalate to the 5-min captive-portal backoff path until
+            // someone (heartbeat probe, command queue) wakes us.
+            s_captive_portal = true;
+            ESP_LOGW(TAG, "%d consecutive empty MapResponses — escalating to captive-portal backoff",
+                     s_consec_empty_map);
+        }
         free(resp_buf);
         return -1;
     }
+
+    // Success: any prior cycling is over; reset the empty counter.
+    s_consec_empty_map = 0;
 
     ESP_LOGI(TAG, "MapResponse JSON: %d bytes", (int)json_total);
 
