@@ -493,7 +493,12 @@ void ml_derp_tx_task(void *arg) {
     uint64_t connected_since_ms = 0;
     bool verbose_phase = false;  /* verbose logging for first 15s after connect */
 
-    while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
+    /* Same NULL-guard rationale as ml_coord_task: if microlink_destroy
+     * deleted ml->events while we're still alive (e.g. mid-handshake on a
+     * captive-portal network), treat NULL as "host wants us gone" and
+     * self-exit instead of panicking in xEventGroupGetBits/ClearBits's
+     * configASSERT(xEventGroup). */
+    while (ml->events && !(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         loop_count++;
         uint64_t loop_start = ml_get_time_ms();
 
@@ -723,7 +728,27 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     int64_t t_derp_tcp = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] DERP TCP connect: %lld ms", (t_derp_tcp - t_derp_dns) / 1000);
 
-    /* TLS setup */
+    /* TLS setup. CRITICAL: free any prior SSL state before re-init.
+     * mbedtls_ssl_init() zeroes the struct without freeing internal heap
+     * allocations; if a previous ml_derp_connect() got partway through
+     * setup() before failing (or completed a connect that's since been
+     * torn down), those buffers are orphaned and a subsequent init()
+     * loses the pointers. esp-idf's dynamic-buffer plumbing
+     * (esp_mbedtls_parse_record_header in esp_mbedtls_dynamic_impl.c:52)
+     * then deref's a dangling pointer in the partially-initialized
+     * context → LoadProhibited panic on the next handshake.
+     *
+     * mbedtls_*_free are safe on already-zeroed or already-freed structs
+     * — they check internal sentinel fields before deref'ing.
+     *
+     * Observed in a captured coredump after a healthspot captive-portal
+     * caused DNS for *.tailscale.com to fail repeatedly; each retry
+     * called ml_derp_connect again, second one panicked. */
+    mbedtls_ssl_free(&ml->derp.ssl);
+    mbedtls_ssl_config_free(&ml->derp.ssl_conf);
+    mbedtls_ctr_drbg_free(&ml->derp.ctr_drbg);
+    mbedtls_entropy_free(&ml->derp.entropy);
+
     mbedtls_ssl_init(&ml->derp.ssl);
     mbedtls_ssl_config_init(&ml->derp.ssl_conf);
     mbedtls_entropy_init(&ml->derp.entropy);

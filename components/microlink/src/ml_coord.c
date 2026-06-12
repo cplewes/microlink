@@ -2209,8 +2209,18 @@ void ml_coord_task(void *arg) {
     /* Noise protocol state - owned exclusively by this task */
     ml_noise_state_t noise = {0};
 
-    /* Wait for WiFi/cellular OR shutdown */
+    /* Wait for WiFi/cellular OR shutdown.
+     * Defensive: microlink_destroy() NULLs ml->events after vEventGroupDelete
+     * so an orphaned ml_coord_task that outlived microlink_stop()'s 3 s drain
+     * (e.g. mid-mbedtls handshake on a captive-portal network with blocked
+     * DNS) sees NULL here and self-exits instead of panicking inside
+     * xEventGroupWaitBits's configASSERT(xEventGroup) at event_groups.c:496. */
     ESP_LOGI(TAG, "Waiting for WiFi...");
+    if (!ml->events) {
+        ESP_LOGW(TAG, "ml->events NULL before WiFi wait; exiting");
+        vTaskDelete(NULL);
+        return;
+    }
     {
         EventBits_t wb = xEventGroupWaitBits(ml->events,
                              ML_EVT_WIFI_CONNECTED | ML_EVT_SHUTDOWN_REQUEST,
@@ -2222,7 +2232,10 @@ void ml_coord_task(void *arg) {
         }
     }
 
-    while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
+    /* Main loop: also NULL-guard on every iteration — ml->events can be
+     * deleted by microlink_destroy() at any point while we're processing
+     * commands or polling. Treat NULL as "host wants us gone" and exit. */
+    while (ml->events && !(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         /* Check for commands (non-blocking) */
         if (xQueueReceive(ml->coord_cmd_queue, &cmd, 0) == pdTRUE) {
             switch (cmd) {

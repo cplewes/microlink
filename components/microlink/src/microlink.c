@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
@@ -367,36 +368,32 @@ skip_bsd_socket:
     ;
 #endif
 
-    /* Create tasks */
+    /* Create tasks. If any create fails (most commonly OOM in internal RAM
+     * when overall heap is low), we MUST clean up any tasks that already
+     * came up before returning — otherwise they become orphans accessing
+     * state that microlink_destroy() will later free, which is what was
+     * generating the observed Guru Meditation (LoadProhibited) and
+     * xEventGroupClearBits NULL asserts in captured coredumps.
+     *
+     * Free heap status is logged with each failure for forensics. */
     BaseType_t ret;
+    const char *failed_task = NULL;
 
     ret = xTaskCreatePinnedToCore(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
                                    ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create net_io task");
-        return ESP_FAIL;
-    }
+    if (ret != pdPASS) { failed_task = "ml_net_io";   goto fail_start; }
 
     ret = xTaskCreatePinnedToCore(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
                                    ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create derp_tx task");
-        return ESP_FAIL;
-    }
+    if (ret != pdPASS) { failed_task = "ml_derp_tx";  goto fail_start; }
 
     ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
                                    ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create coord task");
-        return ESP_FAIL;
-    }
+    if (ret != pdPASS) { failed_task = "ml_coord";    goto fail_start; }
 
     ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
                                    ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create wg_mgr task");
-        return ESP_FAIL;
-    }
+    if (ret != pdPASS) { failed_task = "ml_wg_mgr";   goto fail_start; }
 
     /* WiFi is expected to be connected before microlink_start() is called.
      * Signal the event so coord/wg_mgr tasks proceed immediately. */
@@ -413,6 +410,31 @@ skip_bsd_socket:
 
     ESP_LOGI(TAG, "All tasks started");
     return ESP_OK;
+
+fail_start:
+    /* A task creation failed. The tasks we DID manage to create are now
+     * running and would otherwise orphan-access state on the next destroy.
+     * Signal shutdown and let microlink_stop join them through its normal
+     * 3 s window before returning to the caller, so the partial-init goes
+     * back to a clean ML_STATE_IDLE that the caller can microlink_destroy()
+     * safely.
+     *
+     * Diagnostic dump tells you which task fell over and how starved heap
+     * was at the moment of failure — usually internal RAM exhaustion. */
+    ESP_LOGE(TAG, "Failed to create %s task (free internal=%u psram=%u); "
+                  "rolling back partial init",
+             failed_task,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    /* Set the shutdown bit so any tasks already in their main loop exit
+     * cleanly. microlink_stop()'s 3 s drain then catches them. We then
+     * re-enter ML_STATE_IDLE so the caller can call microlink_destroy()
+     * to release queues + events. */
+    if (ml->events) {
+        xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
+    }
+    microlink_stop(ml);
+    return ESP_FAIL;
 }
 
 esp_err_t microlink_rebind(microlink_t *ml) {
@@ -557,16 +579,25 @@ void microlink_destroy(microlink_t *ml) {
         ml->config_httpd = NULL;
     }
 
-    /* Delete queues */
-    if (ml->derp_tx_queue) vQueueDelete(ml->derp_tx_queue);
-    if (ml->disco_rx_queue) vQueueDelete(ml->disco_rx_queue);
-    if (ml->wg_rx_queue) vQueueDelete(ml->wg_rx_queue);
-    if (ml->stun_rx_queue) vQueueDelete(ml->stun_rx_queue);
-    if (ml->coord_cmd_queue) vQueueDelete(ml->coord_cmd_queue);
-    if (ml->peer_update_queue) vQueueDelete(ml->peer_update_queue);
+    /* Delete queues. NULL the pointers after deletion so any task that
+     * outlived microlink_stop()'s 3 s join window — observed when DNS
+     * to *.tailscale.com is blocked and the task is stuck mid-handshake
+     * or in xQueueReceive with a long timeout — sees NULL on next access
+     * instead of a dangling pointer. NULL-guards in the task loops
+     * (xEventGroupGetBits etc.) treat NULL as "shutting down, self-exit". */
+    if (ml->derp_tx_queue)    { vQueueDelete(ml->derp_tx_queue);    ml->derp_tx_queue    = NULL; }
+    if (ml->disco_rx_queue)   { vQueueDelete(ml->disco_rx_queue);   ml->disco_rx_queue   = NULL; }
+    if (ml->wg_rx_queue)      { vQueueDelete(ml->wg_rx_queue);      ml->wg_rx_queue      = NULL; }
+    if (ml->stun_rx_queue)    { vQueueDelete(ml->stun_rx_queue);    ml->stun_rx_queue    = NULL; }
+    if (ml->coord_cmd_queue)  { vQueueDelete(ml->coord_cmd_queue);  ml->coord_cmd_queue  = NULL; }
+    if (ml->peer_update_queue){ vQueueDelete(ml->peer_update_queue);ml->peer_update_queue= NULL; }
 
-    /* Delete event group */
-    if (ml->events) vEventGroupDelete(ml->events);
+    /* Delete event group. NULL after delete for the same reason as above
+     * — otherwise ml_coord_task / ml_derp_tx_task / ml_wg_mgr_task /
+     * ml_net_io_task hit the configASSERT(xEventGroup) at
+     * event_groups.c:496 on the next xEventGroupGetBits / WaitBits /
+     * ClearBits / SetBits call. */
+    if (ml->events)           { vEventGroupDelete(ml->events);      ml->events           = NULL; }
 
     /* Clear keys from memory */
     memset(ml->machine_private_key, 0, 32);
