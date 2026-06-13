@@ -1417,6 +1417,18 @@ static void disco_periodic_probes(microlink_t *ml) {
     if (start >= ml->peer_count) start = 0;
 
     for (int n = 0; n < ml->peer_count; n++) {
+        /* Per-peer yield. On a tailnet of ~12 active peers, the full
+         * disco loop ran 50-170 ms back-to-back, observed as a 5-second
+         * task watchdog cascade on a 2026-06-13 long-uptime capture:
+         * agent (CPU 1) on the BLE-RPC path got starved out, NimBLE
+         * notify msys pool filled, ble_rpc reported "notify stalled
+         * (msys) at 0/146" every 5 s for 2+ minutes. A 1-tick yield
+         * between peers gives NimBLE host + agent + ml_coord some
+         * scheduler time without measurably affecting DISCO cadence
+         * (the loop itself still completes within the same 1 s outer
+         * cycle, just with shorter peak burst length). */
+        vTaskDelay(1);
+
         int i = (start + n) % ml->peer_count;
         ml_peer_t *p = &ml->peers[i];
         if (!p->active) continue;
