@@ -533,13 +533,20 @@ void ml_derp_tx_task(void *arg) {
             EventBits_t bits = xEventGroupGetBits(ml->events);
             if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected) {
                 xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
-                /* Retry up to 3 times with 2s backoff */
+                /* Retry up to 3 times with 2s backoff. Each attempt can cost
+                 * a DNS timeout plus a 10 s TLS handshake, so re-check for
+                 * shutdown between them — three blind retries is how this
+                 * task used to outlive microlink_stop()'s join window. */
                 for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
                     if (attempt > 0) {
                         ESP_LOGW(TAG, "DERP connect retry %d/3 in 2s...", attempt + 1);
                         vTaskDelay(pdMS_TO_TICKS(2000));
                     } else {
                         ESP_LOGI(TAG, "DERP connect requested, connecting from I/O task");
+                    }
+                    if (ml_shutdown_pending(ml)) {
+                        ESP_LOGI(TAG, "Shutdown during DERP connect; abandoning retries");
+                        break;
                     }
                     if (ml_derp_connect(ml) == ESP_OK) {
                         connected_since_ms = ml_get_time_ms();
@@ -561,6 +568,10 @@ void ml_derp_tx_task(void *arg) {
                     if (attempt > 0) {
                         ESP_LOGW(TAG, "DERP reconnect retry %d/3 in 2s...", attempt + 1);
                         vTaskDelay(pdMS_TO_TICKS(2000));
+                    }
+                    if (ml_shutdown_pending(ml)) {
+                        ESP_LOGI(TAG, "Shutdown during DERP reconnect; abandoning retries");
+                        break;
                     }
                     if (ml_derp_connect(ml) == ESP_OK) {
                         connected_since_ms = ml_get_time_ms();
@@ -640,8 +651,13 @@ void ml_derp_tx_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
+    /* Release the TLS state, the socket and anything still queued for TX.
+     * Nobody else can: microlink_stop() deliberately leaves derp.sockfd to
+     * this task, and on the orphan path the context outlives the stop. */
+    ml_derp_disconnect(ml);
+
     ESP_LOGI(TAG, "DERP I/O task exiting");
-    vTaskDelete(NULL);
+    ml_task_exit(ml, ML_TASK_BIT_DERP_TX);
 }
 
 /* ============================================================================
@@ -689,6 +705,13 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
                 break;
             }
         }
+    }
+
+    /* Don't start a fresh DNS + TCP + TLS sequence the caller is about to
+     * throw away — every phase below can block for seconds. */
+    if (ml_shutdown_pending(ml)) {
+        ESP_LOGI(TAG, "Shutdown requested; not connecting to DERP");
+        return ESP_FAIL;
     }
 
     int64_t t_derp_start = esp_timer_get_time();
@@ -796,6 +819,14 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
     int ret;
     while ((ret = mbedtls_ssl_handshake(&ml->derp.ssl)) != 0) {
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            /* This spin is where the task sat for tens of seconds on a
+             * captive network — each pass costs a full socket read timeout.
+             * Bail out on shutdown so the teardown join doesn't have to wait
+             * for the server to answer. fail_tls frees the mbedTLS state. */
+            if (ml_shutdown_pending(ml)) {
+                ESP_LOGW(TAG, "Shutdown during TLS handshake; aborting");
+                goto fail_tls;
+            }
             continue;
         }
         char err_buf[128];

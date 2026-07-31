@@ -2210,15 +2210,14 @@ void ml_coord_task(void *arg) {
     ml_noise_state_t noise = {0};
 
     /* Wait for WiFi/cellular OR shutdown.
-     * Defensive: microlink_destroy() NULLs ml->events after vEventGroupDelete
-     * so an orphaned ml_coord_task that outlived microlink_stop()'s 3 s drain
-     * (e.g. mid-mbedtls handshake on a captive-portal network with blocked
-     * DNS) sees NULL here and self-exits instead of panicking inside
-     * xEventGroupWaitBits's configASSERT(xEventGroup) at event_groups.c:496. */
+     * The NULL check is belt-and-braces: under the teardown contract (see
+     * microlink.c) the event group cannot be deleted while this task's
+     * ML_TASK_BIT_COORD is set, so ml->events is valid for our whole life.
+     * It stays because it costs nothing and used to be the only guard. */
     ESP_LOGI(TAG, "Waiting for WiFi...");
     if (!ml->events) {
         ESP_LOGW(TAG, "ml->events NULL before WiFi wait; exiting");
-        vTaskDelete(NULL);
+        ml_task_exit(ml, ML_TASK_BIT_COORD);
         return;
     }
     {
@@ -2227,7 +2226,7 @@ void ml_coord_task(void *arg) {
                              pdFALSE, pdFALSE, portMAX_DELAY);
         if (wb & ML_EVT_SHUTDOWN_REQUEST) {
             ESP_LOGI(TAG, "Shutdown requested before WiFi, exiting");
-            vTaskDelete(NULL);
+            ml_task_exit(ml, ML_TASK_BIT_COORD);
             return;
         }
     }
@@ -2679,5 +2678,5 @@ void ml_coord_task(void *arg) {
     memset(&noise, 0, sizeof(noise));
 
     ESP_LOGI(TAG, "Coord task exiting");
-    vTaskDelete(NULL);
+    ml_task_exit(ml, ML_TASK_BIT_COORD);
 }
