@@ -31,6 +31,11 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/net_sockets.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include <errno.h>
 
@@ -102,6 +107,154 @@ static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
 }
 
 /* ============================================================================
+ * Control transport: plain TCP :80 or TLS :443 (CONFIG_ML_CTRL_TRANSPORT_*)
+ *
+ * Everything above the socket (HTTP upgrade, Noise frames, H2) is identical
+ * on both; only these helpers know which one is live. coord_io_recv() keeps
+ * plain recv() semantics (-1 + errno EAGAIN on SO_RCVTIMEO expiry, 0 on
+ * close) so the existing timeout/retry logic works unchanged over TLS.
+ * State is owned exclusively by the coord task. TLS buffers come from PSRAM
+ * via CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC; the context itself is PSRAM too.
+ * ========================================================================== */
+
+typedef struct {
+    mbedtls_ssl_context      ssl;
+    mbedtls_ssl_config       conf;
+    mbedtls_entropy_context  entropy;
+    mbedtls_ctr_drbg_context drbg;
+    int                      fd;
+} coord_tls_t;
+
+static coord_tls_t *s_tls = NULL;          /* non-NULL while TLS is the live transport */
+#if CONFIG_ML_CTRL_TRANSPORT_TLS
+static bool s_ctrl_use_tls = true;
+#else
+static bool s_ctrl_use_tls = false;        /* AUTO flips this on tampering (sticky) */
+#endif
+static int  s_tls_fail_streak = 0;
+#define COORD_TLS_MAX_FAILS 3              /* AUTO: give up on :443 after this many */
+
+static void coord_tls_free(void) {
+    if (!s_tls) return;
+    mbedtls_ssl_free(&s_tls->ssl);
+    mbedtls_ssl_config_free(&s_tls->conf);
+    mbedtls_ctr_drbg_free(&s_tls->drbg);
+    mbedtls_entropy_free(&s_tls->entropy);
+    heap_caps_free(s_tls);
+    s_tls = NULL;
+}
+
+/* Close the coord socket and any TLS session riding on it. */
+static void coord_close_sock(microlink_t *ml) {
+    coord_tls_free();
+    if (ml->coord_sock >= 0) ml_close_sock(ml->coord_sock);
+    ml->coord_sock = -1;
+}
+
+/* AUTO mode: called when the plaintext stream was visibly tampered with. */
+static void coord_note_tampering(const char *why) {
+#if CONFIG_ML_CTRL_TRANSPORT_AUTO
+    if (!s_ctrl_use_tls) {
+        ESP_LOGW(TAG, "Control stream tampered with (%s) -> switching to TLS :443", why);
+        s_ctrl_use_tls = true;
+        s_tls_fail_streak = 0;
+    }
+#else
+    (void)why;
+#endif
+}
+
+static int coord_bio_send(void *ctx, const unsigned char *buf, size_t len) {
+    int n = ml_send(*(int *)ctx, buf, len, 0);
+    if (n >= 0) return n;
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return MBEDTLS_ERR_SSL_WANT_WRITE;
+    return (errno == EPIPE || errno == ECONNRESET) ? MBEDTLS_ERR_NET_CONN_RESET : MBEDTLS_ERR_NET_SEND_FAILED;
+}
+
+/* Honours whatever SO_RCVTIMEO the caller set on the socket. */
+static int coord_bio_recv(void *ctx, unsigned char *buf, size_t len) {
+    int n = ml_recv(*(int *)ctx, buf, len, 0);
+    if (n > 0) return n;
+    if (n == 0) return MBEDTLS_ERR_NET_CONN_RESET;
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return MBEDTLS_ERR_SSL_WANT_READ;
+    return (errno == EPIPE || errno == ECONNRESET) ? MBEDTLS_ERR_NET_CONN_RESET : MBEDTLS_ERR_NET_RECV_FAILED;
+}
+
+static int coord_io_send(microlink_t *ml, const uint8_t *buf, size_t len) {
+    if (!s_tls) return ml_send(ml->coord_sock, buf, len, 0);
+    int r = mbedtls_ssl_write(&s_tls->ssl, buf, len);
+    if (r >= 0) return r;
+    errno = (r == MBEDTLS_ERR_SSL_WANT_WRITE) ? EAGAIN : ECONNRESET;
+    return -1;
+}
+
+static int coord_io_recv(microlink_t *ml, uint8_t *buf, size_t len) {
+    if (!s_tls) return ml_recv(ml->coord_sock, buf, len, 0);
+    int r = mbedtls_ssl_read(&s_tls->ssl, buf, len);
+    if (r > 0) return r;
+    if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+    if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_TIMEOUT) { errno = EAGAIN; return -1; }
+    ESP_LOGW(TAG, "coord TLS read: -0x%04x", -r);
+    errno = ECONNRESET;
+    return -1;
+}
+
+/* Decrypted bytes already buffered inside mbedTLS (select() can't see them). */
+static bool coord_io_pending(void) {
+    return s_tls && mbedtls_ssl_get_bytes_avail(&s_tls->ssl) > 0;
+}
+
+/* TLS handshake on the freshly connected coord socket. 0 on success. */
+static int coord_tls_start(microlink_t *ml) {
+    int64_t t0 = esp_timer_get_time();
+    coord_tls_free();   /* never leak a session from a connection that skipped close */
+    s_tls = heap_caps_calloc(1, sizeof(*s_tls), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_tls) { ESP_LOGE(TAG, "coord TLS: alloc failed"); return -1; }
+    mbedtls_ssl_init(&s_tls->ssl);
+    mbedtls_ssl_config_init(&s_tls->conf);
+    mbedtls_entropy_init(&s_tls->entropy);
+    mbedtls_ctr_drbg_init(&s_tls->drbg);
+    s_tls->fd = ml->coord_sock;
+
+    int r;
+    if ((r = mbedtls_ctr_drbg_seed(&s_tls->drbg, mbedtls_entropy_func, &s_tls->entropy, NULL, 0)) != 0 ||
+        (r = mbedtls_ssl_config_defaults(&s_tls->conf, MBEDTLS_SSL_IS_CLIENT,
+                                         MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        ESP_LOGE(TAG, "coord TLS: setup -0x%04x", -r);
+        coord_tls_free();
+        return -1;
+    }
+    /* Server identity is proven by the Noise IK handshake against the pinned
+     * Tailscale control key; TLS here is only an envelope (same as DERP). */
+    mbedtls_ssl_conf_authmode(&s_tls->conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&s_tls->conf, mbedtls_ctr_drbg_random, &s_tls->drbg);
+    if ((r = mbedtls_ssl_setup(&s_tls->ssl, &s_tls->conf)) != 0 ||
+        (r = mbedtls_ssl_set_hostname(&s_tls->ssl, CTRL_HOST(ml))) != 0) {
+        ESP_LOGE(TAG, "coord TLS: ssl_setup -0x%04x", -r);
+        coord_tls_free();
+        return -1;
+    }
+    mbedtls_ssl_set_bio(&s_tls->ssl, &s_tls->fd, coord_bio_send, coord_bio_recv, NULL);
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    while ((r = mbedtls_ssl_handshake(&s_tls->ssl)) != 0) {
+        bool again = (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE);
+        if (!again || ml_shutdown_pending(ml) ||
+            esp_timer_get_time() - t0 > 20 * 1000000LL) {
+            ESP_LOGE(TAG, "coord TLS handshake failed: -0x%04x", -r);
+            coord_tls_free();
+            return -1;
+        }
+    }
+    tv.tv_sec = 10;     /* restore do_tcp_connect's timeout for the upgrade read */
+    ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ESP_LOGI(TAG, "[TIMING] coord TLS handshake: %lld ms (%s)",
+             (esp_timer_get_time() - t0) / 1000, mbedtls_ssl_get_version(&s_tls->ssl));
+    return 0;
+}
+
+/* ============================================================================
  * TCP I/O helpers for coord socket (owned exclusively by this task)
  * ========================================================================== */
 
@@ -112,7 +265,7 @@ static int coord_send(microlink_t *ml, const uint8_t *data, size_t len) {
 
     size_t sent = 0;
     while (sent < len) {
-        int n = ml_send(ml->coord_sock, data + sent, len - sent, 0);
+        int n = coord_io_send(ml, data + sent, len - sent);
         if (n <= 0) {
             ESP_LOGE(TAG, "coord_send failed: sent=%d/%d n=%d errno=%d",
                      (int)sent, (int)len, n, errno);
@@ -127,7 +280,7 @@ static int coord_recv(microlink_t *ml, uint8_t *buf, size_t len) {
     size_t recvd = 0;
     int retries = 0;
     while (recvd < len) {
-        int n = ml_recv(ml->coord_sock, buf + recvd, len - recvd, 0);
+        int n = coord_io_recv(ml, buf + recvd, len - recvd);
         if (n <= 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (recvd == 0) {
@@ -192,6 +345,9 @@ static int noise_recv(microlink_t *ml, ml_noise_state_t *noise,
 
     if (hdr[0] != 0x04) {
         ESP_LOGE(TAG, "Unexpected Noise frame type: 0x%02x", hdr[0]);
+        /* 'H' = an "HTTP/1.x ..." response spliced into the stream by a
+         * middlebox (seen on the healthspot FortiGate). */
+        if (hdr[0] == 'H' && !s_tls) coord_note_tampering("HTTP spliced into Noise stream");
         return -1;
     }
 
@@ -247,7 +403,8 @@ static int do_tcp_connect(microlink_t *ml) {
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
     struct addrinfo *res = NULL;
 
-    if (ml_getaddrinfo(CTRL_HOST(ml), "80", &hints, &res) != 0 || !res) {
+    const bool use_tls = s_ctrl_use_tls;
+    if (ml_getaddrinfo(CTRL_HOST(ml), use_tls ? "443" : "80", &hints, &res) != 0 || !res) {
         ESP_LOGE(TAG, "DNS resolve failed for %s", CTRL_HOST(ml));
         return -1;
     }
@@ -277,7 +434,7 @@ static int do_tcp_connect(microlink_t *ml) {
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
     ml_setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
 
-    ESP_LOGI(TAG, "Connecting to %s:80...", CTRL_HOST(ml));
+    ESP_LOGI(TAG, "Connecting to %s:%s...", CTRL_HOST(ml), use_tls ? "443 (TLS)" : "80");
 
     if (ml_connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         ESP_LOGE(TAG, "TCP connect failed: %d", errno);
@@ -292,6 +449,20 @@ static int do_tcp_connect(microlink_t *ml) {
              (t_tcp - t_dns) / 1000, (t_tcp - t_start) / 1000);
 
     ml->coord_sock = sock;
+    if (use_tls) {
+        if (coord_tls_start(ml) != 0) {
+            coord_close_sock(ml);
+#if CONFIG_ML_CTRL_TRANSPORT_AUTO
+            if (++s_tls_fail_streak >= COORD_TLS_MAX_FAILS) {
+                ESP_LOGW(TAG, "TLS :443 failed %d times -> back to plain :80", s_tls_fail_streak);
+                s_ctrl_use_tls = false;
+                s_tls_fail_streak = 0;
+            }
+#endif
+            return -1;
+        }
+        s_tls_fail_streak = 0;
+    }
     return 0;
 }
 
@@ -354,7 +525,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     uint8_t *resp = ml_psram_malloc(2048);
     if (!resp) return -1;
 
-    int total = ml_recv(ml->coord_sock, resp, 2047, 0);
+    int total = coord_io_recv(ml, resp, 2047);
     if (total <= 0) {
         ESP_LOGE(TAG, "Handshake recv failed: %d (errno=%d)", total, errno);
         // Some captive portals close the TCP connection immediately
@@ -499,7 +670,7 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
         extra_data = ml_psram_malloc(1024);
         if (extra_data) {
-            int n = ml_recv(ml->coord_sock, extra_data, 1024, 0);
+            int n = coord_io_recv(ml, extra_data, 1024);
             if (n > 0) {
                 extra_len = n;
                 ESP_LOGI(TAG, "Read %d bytes of proactive frames from socket", extra_len);
@@ -2059,7 +2230,8 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
     FD_ZERO(&readfds);
     FD_SET(ml->coord_sock, &readfds);
     struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms */
-    int sel = ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
+    int sel = coord_io_pending() ? 1
+            : ml_select_fds(ml->coord_sock + 1, &readfds, NULL, NULL, &tv);
     if (sel <= 0) return 0;  /* No data available or error */
 
     /* Data available — set short recv timeout for partial frame safety */
@@ -2246,7 +2418,7 @@ void ml_coord_task(void *arg) {
                 break;
             case ML_CMD_DISCONNECT:
                 if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
+                    coord_close_sock(ml);
                     ml->coord_sock = -1;
                 }
                 state = COORD_IDLE;
@@ -2312,7 +2484,7 @@ void ml_coord_task(void *arg) {
             ml->state = ML_STATE_REGISTERING;
             if (do_noise_handshake(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Noise handshake failed");
-                ml_close_sock(ml->coord_sock);
+                coord_close_sock(ml);
                 ml->coord_sock = -1;
                 state = COORD_RECONNECTING;
                 break;
@@ -2327,7 +2499,7 @@ void ml_coord_task(void *arg) {
         case COORD_H2_PREFACE:
             if (do_h2_preface(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "H2 preface failed");
-                ml_close_sock(ml->coord_sock);
+                coord_close_sock(ml);
                 ml->coord_sock = -1;
                 state = COORD_RECONNECTING;
                 break;
@@ -2339,7 +2511,7 @@ void ml_coord_task(void *arg) {
             ESP_LOGI(TAG, "Registering...");
             if (do_register(ml, &noise) < 0) {
                 ESP_LOGE(TAG, "Registration failed");
-                ml_close_sock(ml->coord_sock);
+                coord_close_sock(ml);
                 ml->coord_sock = -1;
                 state = COORD_RECONNECTING;
                 break;
@@ -2351,7 +2523,7 @@ void ml_coord_task(void *arg) {
             ESP_LOGI(TAG, "Fetching peers...");
             if (do_fetch_peers(ml, &noise) < 0) {
                 ESP_LOGW(TAG, "MapRequest failed, will retry");
-                ml_close_sock(ml->coord_sock);
+                coord_close_sock(ml);
                 ml->coord_sock = -1;
                 state = COORD_RECONNECTING;
                 break;
@@ -2657,7 +2829,7 @@ void ml_coord_task(void *arg) {
 
                 /* Close old connection */
                 if (ml->coord_sock >= 0) {
-                    ml_close_sock(ml->coord_sock);
+                    coord_close_sock(ml);
                     ml->coord_sock = -1;
                 }
 
@@ -2672,7 +2844,7 @@ void ml_coord_task(void *arg) {
 
     /* Cleanup */
     if (ml->coord_sock >= 0) {
-        ml_close_sock(ml->coord_sock);
+        coord_close_sock(ml);
         ml->coord_sock = -1;
     }
     memset(&noise, 0, sizeof(noise));

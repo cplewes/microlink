@@ -20,6 +20,26 @@ menu "MicroLink V2 Configuration"
 
             Zero-copy mode contributed by dj-oyu (https://github.com/dj-oyu/microlink)
 
+    choice ML_CTRL_TRANSPORT
+        prompt "Control-plane transport"
+        default ML_CTRL_TRANSPORT_AUTO
+        help
+            How to reach the coordination server's /ts2021 Noise upgrade.
+            AUTO: plain TCP :80 (like tailscaled's first try), switching to
+            TLS :443 for the rest of the uptime once a middlebox is seen
+            tampering with the plaintext stream (e.g. a captive proxy
+            injecting an HTTP response mid-long-poll). Falls back to :80 if
+            :443 fails repeatedly. The server is authenticated by the Noise
+            handshake either way; TLS only hides the stream from middleboxes.
+
+        config ML_CTRL_TRANSPORT_AUTO
+            bool "Auto (:80, fall back to TLS :443 on tampering)"
+        config ML_CTRL_TRANSPORT_TLS
+            bool "Always TLS :443"
+        config ML_CTRL_TRANSPORT_PLAIN
+            bool "Always plain :80"
+    endchoice
+
     config ML_MAX_PEERS
         int "Maximum simultaneous WireGuard peers"
         default 16

@@ -51,7 +51,7 @@ extern "C" {
 #define ML_TASK_DERP_TX_PRIO    5
 #define ML_TASK_DERP_TX_CORE    0
 
-#define ML_TASK_COORD_STACK     (12 * 1024)
+#define ML_TASK_COORD_STACK     (14 * 1024)   /* +2 KB: TLS :443 handshake */
 #define ML_TASK_COORD_PRIO      5
 #define ML_TASK_COORD_CORE      1
 
