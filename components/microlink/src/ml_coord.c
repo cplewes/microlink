@@ -129,10 +129,10 @@ static coord_tls_t *s_tls = NULL;          /* non-NULL while TLS is the live tra
 #if CONFIG_ML_CTRL_TRANSPORT_TLS
 static bool s_ctrl_use_tls = true;
 #else
-static bool s_ctrl_use_tls = false;        /* AUTO flips this on tampering (sticky) */
+static bool s_ctrl_use_tls = false;        /* flipped on tampering (sticky) */
 #endif
 static int  s_tls_fail_streak = 0;
-#define COORD_TLS_MAX_FAILS 3              /* AUTO: give up on :443 after this many */
+#define COORD_TLS_MAX_FAILS 3              /* give up on :443 after this many in a row */
 
 static void coord_tls_free(void) {
     if (!s_tls) return;
@@ -151,9 +151,9 @@ static void coord_close_sock(microlink_t *ml) {
     ml->coord_sock = -1;
 }
 
-/* AUTO mode: called when the plaintext stream was visibly tampered with. */
+/* Called when the plaintext stream was visibly tampered with (not in PLAIN). */
 static void coord_note_tampering(const char *why) {
-#if CONFIG_ML_CTRL_TRANSPORT_AUTO
+#if !CONFIG_ML_CTRL_TRANSPORT_PLAIN
     if (!s_ctrl_use_tls) {
         ESP_LOGW(TAG, "Control stream tampered with (%s) -> switching to TLS :443", why);
         s_ctrl_use_tls = true;
@@ -452,7 +452,7 @@ static int do_tcp_connect(microlink_t *ml) {
     if (use_tls) {
         if (coord_tls_start(ml) != 0) {
             coord_close_sock(ml);
-#if CONFIG_ML_CTRL_TRANSPORT_AUTO
+#if !CONFIG_ML_CTRL_TRANSPORT_PLAIN
             if (++s_tls_fail_streak >= COORD_TLS_MAX_FAILS) {
                 ESP_LOGW(TAG, "TLS :443 failed %d times -> back to plain :80", s_tls_fail_streak);
                 s_ctrl_use_tls = false;

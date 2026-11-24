@@ -35,7 +35,7 @@ menu "MicroLink V2 Configuration"
         config ML_CTRL_TRANSPORT_AUTO
             bool "Auto (:80, fall back to TLS :443 on tampering)"
         config ML_CTRL_TRANSPORT_TLS
-            bool "Always TLS :443"
+            bool "Prefer TLS :443 (still falls back to :80 after 3 failures)"
         config ML_CTRL_TRANSPORT_PLAIN
             bool "Always plain :80"
     endchoice
