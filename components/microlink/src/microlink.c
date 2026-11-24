@@ -8,7 +8,6 @@
 
 #include "microlink_internal.h"
 #include "esp_log.h"
-#include "freertos/idf_additions.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
@@ -213,32 +212,8 @@ void ml_task_exit(microlink_t *ml, uint32_t task_bit) {
     /* ml, ml->events and every ml-owned queue are off limits from here on:
      * clearing the bit above is exactly what licenses another task to free
      * them, possibly before the vTaskDelete() below has even run. */
-#if ML_TASK_STACKS_IN_PSRAM
-    /* These were created WithCaps: a plain vTaskDelete(NULL) would leak the
-     * PSRAM stack + TCB on every restart (the idle task doesn't free
-     * caller-provided buffers). IDF >=5.5's vTaskDeleteWithCaps(NULL) hands
-     * the job to a short-lived cleanup task; it touches nothing of ml's. */
-    if (task_bit & (ML_TASK_BIT_DERP_TX | ML_TASK_BIT_COORD)) {
-        vTaskDeleteWithCaps(NULL);
-    }
-#endif
     vTaskDelete(NULL);
     for (;;) { vTaskDelay(portMAX_DELAY); }  /* not reached */
-}
-
-/* Create one of the two large workers, in PSRAM when enabled. Falls back to
- * internal RAM never: a silent fallback would make ml_task_exit() pick the
- * wrong delete, so failure is reported and handled by fail_start like any
- * other create failure. */
-static BaseType_t ml_task_create_big(TaskFunction_t fn, const char *name,
-                                     uint32_t stack, void *arg, UBaseType_t prio,
-                                     TaskHandle_t *out, BaseType_t core) {
-#if ML_TASK_STACKS_IN_PSRAM
-    return xTaskCreatePinnedToCoreWithCaps(fn, name, stack, arg, prio, out, core,
-                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#else
-    return xTaskCreatePinnedToCore(fn, name, stack, arg, prio, out, core);
-#endif
 }
 
 static void ml_describe_tasks(uint32_t mask, char *out, size_t out_len) {
@@ -597,13 +572,13 @@ skip_bsd_socket:
     if (ret != pdPASS) { failed_task = "ml_net_io";  failed_bit = ML_TASK_BIT_NET_IO;  goto fail_start; }
 
     __atomic_fetch_or(&ml->tasks_running, ML_TASK_BIT_DERP_TX, __ATOMIC_RELEASE);
-    ret = ml_task_create_big(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
-                             ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
+    ret = xTaskCreatePinnedToCore(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
+                                   ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
     if (ret != pdPASS) { failed_task = "ml_derp_tx"; failed_bit = ML_TASK_BIT_DERP_TX; goto fail_start; }
 
     __atomic_fetch_or(&ml->tasks_running, ML_TASK_BIT_COORD, __ATOMIC_RELEASE);
-    ret = ml_task_create_big(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
-                             ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
+    ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
+                                   ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
     if (ret != pdPASS) { failed_task = "ml_coord";   failed_bit = ML_TASK_BIT_COORD;   goto fail_start; }
 
     __atomic_fetch_or(&ml->tasks_running, ML_TASK_BIT_WG_MGR, __ATOMIC_RELEASE);

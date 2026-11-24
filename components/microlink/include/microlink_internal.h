@@ -56,17 +56,6 @@ extern "C" {
 #define ML_TASK_COORD_CORE      1
 
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
-
-/* derp_tx + coord stacks live in PSRAM (xTaskCreatePinnedToCoreWithCaps).
- * They are the two largest stacks (26 KB) and are re-created on every
- * microlink restart, when internal DRAM is most fragmented — a 12-14 KB
- * contiguous internal block is exactly what's missing on a bad day.
- * Safe because CONFIG_SPI_FLASH_AUTO_SUSPEND keeps the cache enabled during
- * flash ops (NVS from these tasks is fine). Exit must then go through
- * vTaskDeleteWithCaps — see ml_task_exit(). Set to 0 to roll back. */
-#ifndef ML_TASK_STACKS_IN_PSRAM
-#define ML_TASK_STACKS_IN_PSRAM 1
-#endif
 #define ML_TASK_WG_MGR_PRIO     7
 #define ML_TASK_WG_MGR_CORE     1
 
